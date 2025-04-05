@@ -4,7 +4,7 @@ import logging
 import math
 import asyncio
 import os
-from typing import Optional
+from typing import Optional, List
 
 # Import vector database and embedding model
 from models.embedding_model import create_embeddings
@@ -59,10 +59,10 @@ class QueryRequest(BaseModel):
     api_key: Optional[str] = None  # Optional API key for remote LLMs
 
 class QueryResponse(BaseModel):
-    answer: str
-    reasoning: str = Field(default="", description="Step-by-step reasoning before the final answer")
-    source_urls: list[str] = []
-    model_used: Optional[str] = None
+    answer: str = Field(description="The final answer to the user's question")
+    reasoning: str = Field(default="", description="The step-by-step reasoning process that led to the answer")
+    source_urls: list[str] = Field(default_factory=list, description="URLs of sources used to generate the answer")
+    model_used: Optional[str] = Field(default=None, description="Name of the LLM model used to generate the response")
 
 # Define the structured response format for the LLM
 class LLMStructuredResponse(BaseModel):
@@ -157,22 +157,27 @@ async def query_llm(question: str, llm_choice: str = "local", model: Optional[st
     combined_context = "\n\n---\n\n".join(context_parts)
     
     # Update prompt to ask for structured information without specifying format
-    prompt = f"""Answer the question based only on the following context. If the context doesn't contain the answer, say "I don't have information about that in my knowledge base."
+    structured_prompt = f"""Answer the question based only on the following context. If the context doesn't contain the answer, say "I don't have information about that in my knowledge base."
 
 Context:
 {combined_context}
 
 Question: {question}
 
-Think step-by-step before providing your final answer.
+You MUST structure your response in exactly this format:
+1. First provide your step-by-step reasoning
+2. Then provide your final answer
+
+```
+Reasoning: [your detailed reasoning here]
+Answer: [your concise answer here]
+```
+Reasoning:
 """
 
     try:
         # Get appropriate client based on LLM choice
         base_client = get_openai_client(llm_choice, api_key)
-        
-        # Wrap with instructor for structured output
-        client = instructor.from_openai(base_client)
         
         # Get appropriate model based on provider and user selection
         model_id = get_model_for_provider(llm_choice, model)
@@ -187,34 +192,34 @@ Think step-by-step before providing your final answer.
         logger.info(f"Using model: {model_id} with max_tokens: {max_tokens}")
         
         try:
-            # Use instructor to get structured output directly
-            structured_response = client.chat.completions.create(
-                model=model_id,
-                response_model=LLMStructuredResponse,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=max_tokens
-            )
-            
-            # Extract fields from the structured response
-            reasoning = structured_response.reasoning
-            answer = structured_response.answer
-            
-        except Exception as structured_error:
-            logger.error(f"Error using structured output: {structured_error}. Falling back to standard completion.")
-            
-            # Fallback to standard completion if structured output fails
+            # Use regular completion and parse the response manually
             response = base_client.chat.completions.create(
                 model=model_id,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": structured_prompt}],
                 temperature=0.7,
                 max_tokens=max_tokens
             )
             
             full_response = response.choices[0].message.content
-            # Fallback if structured format wasn't followed
+            
+            # Parse the response to extract reasoning and answer
+            reasoning = ""
             answer = full_response
-            reasoning = "No structured reasoning available. Please check the answer for details."
+            
+            # Try to extract reasoning and answer based on the format
+            if "Reasoning:" in full_response and "Answer:" in full_response:
+                parts = full_response.split("Answer:")
+                if len(parts) > 1:
+                    answer = parts[1].strip()
+                    reasoning_parts = parts[0].split("Reasoning:")
+                    if len(reasoning_parts) > 1:
+                        reasoning = reasoning_parts[1].strip()
+            
+        except Exception as parse_error:
+            logger.error(f"Error parsing structured response: {parse_error}. Using full response as answer.")
+            # Fallback to using the full response as answer
+            answer = full_response
+            reasoning = "Unable to extract structured reasoning."
         
         # Get readable model name for the response
         if llm_choice == "groq" and model_id in GROQ_MODELS:
